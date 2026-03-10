@@ -5,6 +5,8 @@ import * as uloop from "uloop";
 import * as uci from "uci";
 import * as nl80211 from "nl80211";
 import { readfile } from "fs";
+import * as wifi_iface from "wifi_iface";
+import * as wifi_device from "wifi_device";
 
 uloop.init();
 let conn = ubus.connect();
@@ -12,26 +14,37 @@ let cursor = uci.cursor();
 let published = {};
 let reload_timer;
 
-// scan_cache[ifname][bssid] = { bssid, ssid, frequency, signal, last_seen }
-let scan_cache = {};
-
-// Max age before evicting stale entries (10 minutes)
-const MAX_AGE = 600;
-
-// Get ifname mapping from network.wireless status
+// Parse network.wireless status into ifname and wiphy maps
 function get_wireless_status() {
 	let status = conn.call("network.wireless", "status");
 	if (!status)
-		return {};
+		return { ifnames: {}, wiphys: {} };
 
-	let map = {};
+	let ifnames = {};
+	let radios = {};
+
 	for (let radio, rdata in status) {
+		let info = { band: rdata.config?.band };
+
+		// Get wiphy from first interface on this radio
 		for (let iface in rdata.interfaces) {
 			if (iface.section && iface.ifname)
-				map[iface.section] = iface.ifname;
+				ifnames[iface.section] = iface.ifname;
+
+			if (info.wiphy == null && iface.ifname) {
+				let r = nl80211.request(
+					nl80211.const.NL80211_CMD_GET_INTERFACE, 0,
+					{ dev: iface.ifname }
+				);
+				if (r)
+					info.wiphy = r.wiphy;
+			}
 		}
+
+		radios[radio] = info;
 	}
-	return map;
+
+	return { ifnames, radios };
 }
 
 // Resolve ifindex to ifname
@@ -47,70 +60,6 @@ function ifindex_to_ifname(ifindex) {
 			return iface.dev;
 	}
 	return null;
-}
-
-// Update scan cache for a given ifname
-function update_scan_cache(ifname) {
-	let results = nl80211.request(
-		nl80211.const.NL80211_CMD_GET_SCAN,
-		nl80211.const.NLM_F_DUMP,
-		{ dev: ifname }
-	);
-
-	if (!results)
-		return;
-
-	let now = time();
-	scan_cache[ifname] ??= {};
-
-	for (let entry in results) {
-		let bss = entry.bss;
-		if (!bss || !bss.bssid)
-			continue;
-
-		let info = {
-			bssid: bss.bssid,
-			frequency: bss.frequency,
-			signal: bss.signal_mbm ? bss.signal_mbm / 100 : null,
-			last_seen: now,
-		};
-
-		if (bss.information_elements) {
-			for (let ie in bss.information_elements) {
-				if (ie.type == 0)
-					info.ssid = ie.data;
-			}
-		}
-
-		scan_cache[ifname][bss.bssid] = info;
-	}
-
-	// Evict stale entries
-	for (let bssid, entry in scan_cache[ifname]) {
-		if (now - entry.last_seen > MAX_AGE)
-			delete scan_cache[ifname][bssid];
-	}
-}
-
-// Get cached results with per-entry age
-function get_cached_results(ifname) {
-	let cache = scan_cache[ifname];
-	if (!cache)
-		return [];
-
-	let now = time();
-	let results = [];
-	for (let bssid, entry in cache) {
-		push(results, {
-			bssid: entry.bssid,
-			ssid: entry.ssid,
-			frequency: entry.frequency,
-			signal: entry.signal,
-			age: now - entry.last_seen,
-		});
-	}
-
-	return results;
 }
 
 // nl80211 scan event listener
@@ -130,9 +79,7 @@ nl80211.listener((msg) => {
 
 	if (msg.cmd == nl80211.const.NL80211_CMD_NEW_SCAN_RESULTS) {
 		printf("wifimngr: scan results ready on %s\n", ifname);
-		update_scan_cache(ifname);
-		printf("wifimngr: %d BSS entries cached for %s\n",
-			length(scan_cache[ifname]), ifname);
+		wifi_device.on_scan_event(ifname);
 	}
 
 	if (msg.cmd == nl80211.const.NL80211_CMD_SCAN_ABORTED) {
@@ -152,20 +99,23 @@ function publish_entries() {
 	}
 
 	cursor.load("wireless");
-	let ifname_map = get_wireless_status();
+	let ws = get_wireless_status();
 
 	// Register wifi.radio.X for each wifi-device
 	cursor.foreach("wireless", "wifi-device", function(s) {
 		let name = s[".name"];
+		let info = ws.radios[name];
+
+		if (!info || info.wiphy == null) {
+			printf("wifimngr: no wiphy for %s, skipping\n", name);
+			return;
+		}
+
+		let dev = wifi_device.create(name, info.wiphy, info.band);
 		let obj_name = "wifi.radio." + name;
-		published[obj_name] = conn.publish(obj_name, {
-			config: {
-				call: function(req) {
-					cursor.load("wireless");
-					req.reply(cursor.get_all("wireless", name));
-				}
-			}
-		});
+		published[obj_name] = conn.publish(obj_name, dev.ubus_methods(cursor));
+
+		printf("wifimngr: registered %s (wiphy=%d, band=%s)\n", obj_name, info.wiphy, info.band);
 	});
 
 	// Register wifi.ap.X or wifi.sta.X using real ifname
@@ -173,46 +123,18 @@ function publish_entries() {
 		let section = s[".name"];
 		let mode = s.mode || "ap";
 		let prefix = (mode == "sta") ? "wifi.sta." : "wifi.ap.";
-		let ifname = s.ifname || ifname_map[section];
+		let ifname = s.ifname || ws.ifnames[section];
 
 		if (!ifname) {
 			printf("wifimngr: no ifname for %s, skipping\n", section);
 			return;
 		}
 
+		let iface = wifi_iface.create(ifname, section, mode);
 		let obj_name = prefix + ifname;
-		published[obj_name] = conn.publish(obj_name, {
-			config: {
-				call: function(req) {
-					cursor.load("wireless");
-					req.reply(cursor.get_all("wireless", section));
-				}
-			},
-			scan: {
-				call: function(req) {
-					let results = get_cached_results(ifname);
-					if (length(results)) {
-						req.reply({ results });
-						return;
-					}
+		published[obj_name] = conn.publish(obj_name, iface.ubus_methods(cursor));
 
-					let ret = nl80211.request(
-						nl80211.const.NL80211_CMD_TRIGGER_SCAN,
-						0, { dev: ifname }
-					);
-					if (ret == false) {
-						req.reply({ error: "scan trigger failed: " + nl80211.error() });
-						return;
-					}
-					req.reply({ status: "scan_triggered" });
-				}
-			},
-			scan_results: {
-				call: function(req) {
-					req.reply({ results: get_cached_results(ifname) });
-				}
-			},
-		});
+		printf("wifimngr: registered %s (section=%s)\n", obj_name, section);
 	});
 
 	printf("wifimngr: published %d entries\n", length(published));
