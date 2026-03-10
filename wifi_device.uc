@@ -1,4 +1,5 @@
 import * as nl80211 from "nl80211";
+import * as wifi_opclass from "wifi_opclass";
 
 const band_names = { "0": "2g", "1": "5g", "3": "6g" };
 const iftype_names = { "managed": "sta", "ap": "ap", "ibss": "adhoc", "mesh_point": "mesh", "monitor": "monitor", "p2p_client": "p2p_client", "p2p_go": "p2p_go" };
@@ -127,11 +128,23 @@ function get_wiphy_bands() {
 			if (!band)
 				continue;
 
-			let cur = bands[i] ??= { frequencies: [], bitrates: [] };
+			let cur = bands[i] ??= { frequencies: [], freq_info: {}, bitrates: [] };
 
 			for (let freq in band.freqs) {
-				if (!freq.disabled)
-					push(cur.frequencies, freq.freq);
+				if (freq.disabled)
+					continue;
+				push(cur.frequencies, freq.freq);
+				let fi = {
+					txpower: freq.max_tx_power ? freq.max_tx_power / 100 : 0,
+					dfs: !!freq.radar,
+				};
+				if (freq.radar) {
+					const dfs_states = [ "usable", "available", "unavailable" ];
+					fi.dfs_state = dfs_states[freq.dfs_state] ?? "unknown";
+					// Weather radar band (5600-5650 MHz) requires 10min CAC
+					fi.cac_time = (freq.freq >= 5600 && freq.freq <= 5650) ? 600 : 60;
+				}
+				cur.freq_info[freq.freq] = fi;
 			}
 
 			for (let rate in band.bitrates)
@@ -243,6 +256,21 @@ function get_status() {
 	}
 
 	return status;
+}
+
+function get_e4() {
+	let bands = this.get_wiphy_bands();
+	if (!bands)
+		return null;
+
+	for (let idx, band in bands) {
+		if ((band_names[idx] ?? idx) != this.band)
+			continue;
+
+		return wifi_opclass.get_preferences(band.freq_info);
+	}
+
+	return null;
 }
 
 function update_scan_cache(dev) {
@@ -361,6 +389,16 @@ function ubus_methods(cursor) {
 				req.reply({ results: self.get_scan_results() });
 			}
 		},
+		e4: {
+			call: function(req) {
+				let prefs = self.get_e4();
+				if (!prefs) {
+					req.reply({ error: "phy not found" });
+					return;
+				}
+				req.reply({ pref_opclass: prefs });
+			}
+		},
 	};
 }
 
@@ -369,6 +407,7 @@ const device_proto = {
 	get_band_freqs,
 	get_band_freq_set,
 	get_status,
+	get_e4,
 	update_scan_cache,
 	get_scan_results,
 	trigger_scan,
