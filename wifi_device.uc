@@ -402,6 +402,43 @@ function get_scan_results() {
 	return results;
 }
 
+function get_survey() {
+	let freq_set = this.get_band_freq_set();
+	let dev = find_scan_dev(this.wiphy, freq_set);
+	if (!dev)
+		return null;
+
+	let r = nl80211.request(
+		nl80211.const.NL80211_CMD_GET_SURVEY,
+		nl80211.const.NLM_F_DUMP,
+		{ dev }
+	);
+	if (!r)
+		return null;
+
+	let parts = type(r) == "array" ? r : [ r ];
+	let out = [];
+	for (let p in parts) {
+		let s = p.survey_info;
+		if (!s || !s.frequency)
+			continue;
+		if (freq_set && !freq_set[s.frequency])
+			continue;
+		let entry = { frequency: s.frequency };
+		if (s.noise != null)        entry.noise = s.noise;
+		if (s.in_use)               entry.in_use = true;
+		if (s.time != null)         entry.active = s.time;
+		if (s.busy != null)         entry.busy = s.busy;
+		if (s.ext_busy != null)     entry.ext_busy = s.ext_busy;
+		if (s.time_rx != null)      entry.rx = s.time_rx;
+		if (s.time_tx != null)      entry.tx = s.time_tx;
+		if (s.scan != null)         entry.scan = s.scan;
+		if (s.time_bss_rx != null)  entry.bss_rx = s.time_bss_rx;
+		push(out, entry);
+	}
+	return out;
+}
+
 function trigger_scan() {
 	let freq_set = this.get_band_freq_set();
 	let dev = find_scan_dev(this.wiphy, freq_set);
@@ -455,6 +492,16 @@ function ubus_methods(cursor) {
 				req.reply({ results: self.get_scan_results() });
 			}
 		},
+		survey: {
+			call: function(req) {
+				let s = self.get_survey();
+				if (s == null) {
+					req.reply({ error: "survey failed: " + nl80211.error() });
+					return;
+				}
+				req.reply({ survey: s });
+			}
+		},
 		e4: {
 			call: function(req) {
 				let prefs = self.get_e4();
@@ -477,6 +524,7 @@ const device_proto = {
 	update_scan_cache,
 	get_scan_results,
 	trigger_scan,
+	get_survey,
 	ubus_methods,
 };
 
