@@ -333,7 +333,8 @@ function get_e4() {
 		if ((band_names[idx] ?? idx) != this.band)
 			continue;
 
-		return wifi_opclass.get_preferences(band.freq_info);
+		let survey = this.get_survey();
+		return wifi_opclass.get_preferences(band.freq_info, survey);
 	}
 
 	return null;

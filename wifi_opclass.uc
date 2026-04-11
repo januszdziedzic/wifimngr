@@ -140,8 +140,35 @@ function chan_to_freq(ch, opclass_id) {
 	return 5950 + ch * 5;
 };
 
-export function get_preferences(freq_info) {
+// Compute utilization % for one ctrl frequency from survey data.
+// Returns null if the survey entry has no usable active/busy counters.
+function freq_utilization(s) {
+	if (!s || !s.active || s.busy == null)
+		return null;
+	if (s.active == 0)
+		return null;
+	let util = (s.busy * 100) / s.active;
+	if (util < 0) util = 0;
+	if (util > 100) util = 100;
+	return util;
+}
+
+export function get_preferences(freq_info, survey) {
 	let result = [];
+	let by_freq = {};
+	if (survey) {
+		for (let s in survey)
+			if (s?.frequency)
+				by_freq[s.frequency] = s;
+	}
+
+	// Max regulatory txpower (dBm) across all enabled freqs in this band.
+	// Used to penalize channels whose allowed txpower is below the band max.
+	let max_txpower = null;
+	for (let f, fi in freq_info) {
+		if (fi?.txpower != null && (max_txpower == null || fi.txpower > max_txpower))
+			max_txpower = fi.txpower;
+	}
 
 	for (let oc in e4) {
 		let channels = [];
@@ -158,6 +185,8 @@ export function get_preferences(freq_info) {
 			let dfs_state = null;
 			let cac_time = 0;
 			let ch_txpower = null;
+			let max_util = null;
+			let min_noise = null;
 
 			for (let c in ctrl) {
 				let freq = chan_to_freq(c, oc.id);
@@ -183,6 +212,15 @@ export function get_preferences(freq_info) {
 				}
 				if (ch_txpower == null || fi.txpower < ch_txpower)
 					ch_txpower = fi.txpower;
+
+				let s = by_freq[freq];
+				if (s) {
+					let u = freq_utilization(s);
+					if (u != null && (max_util == null || u > max_util))
+						max_util = u;
+					if (s.noise != null && (min_noise == null || s.noise < min_noise))
+						min_noise = s.noise;
+				}
 			}
 
 			if (!supported) {
@@ -197,12 +235,39 @@ export function get_preferences(freq_info) {
 
 			any_supported = true;
 
+			// With survey data: score in 1..100, idle=100, fully busy≈1,
+			// additionally scaled by txpower ratio (ch allowed / band max).
+			// Without survey data: reserved sentinel 255 ("unknown").
+			// (Reserve 0 for "unsupported"; supported channels always ≥ 1.)
+			let score = 255;
+			if (max_util != null) {
+				let util_score = 100 - int(max_util);
+				// Multiply before divide to avoid ucode integer division truncating to 0.
+				if (max_txpower && ch_txpower != null && ch_txpower < max_txpower)
+					score = (util_score * ch_txpower) / max_txpower;
+				else
+					score = util_score;
+				score = int(score);
+				if (score < 1) score = 1;
+				if (score > 100) score = 100;
+			}
+
+			// 2.4 GHz (opclass 81..84): only ch 1/6/11 are non-overlapping —
+			// penalize every other channel to the minimum so they're rarely picked.
+			if (oc.id >= 81 && oc.id <= 84 && ch != 1 && ch != 6 && ch != 11)
+				score = (score == 255) ? 1 : (score > 1 ? 1 : score);
+
 			let ch_info = {
 				channel: ch,
-				score: 255,
+				score,
 				txpower: ch_txpower,
 				dfs,
 			};
+
+			if (max_util != null)
+				ch_info.utilization = int(max_util);
+			if (min_noise != null)
+				ch_info.noise = min_noise;
 
 			if (dfs) {
 				ch_info.dfs_state = dfs_state;
