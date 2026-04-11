@@ -5,7 +5,8 @@ import hostapd from "hostapd_cli";
 function hostapd_info(ifname) {
 	let cfg = hostapd.get_config(ifname);
 	let st = hostapd.status(ifname);
-	if (!cfg && !st)
+	let beacon = hostapd.dump_beacon(ifname);
+	if (!cfg && !st && !beacon)
 		return null;
 	let info = {};
 	if (st?.state != null)
@@ -20,9 +21,14 @@ function hostapd_info(ifname) {
 	let enc = hostapd.encryption(cfg);
 	if (enc)
 		info.encryption = enc;
-	let h = hostapd.hidden(ifname);
-	if (h != null)
-		info._hidden = h;
+	if (beacon) {
+		let h = hostapd.beacon_hidden(beacon);
+		if (h != null)
+			info._hidden = h;
+		let caps = hostapd.beacon_caps(beacon);
+		if (length(caps))
+			info.caps = caps;
+	}
 	return info;
 }
 
