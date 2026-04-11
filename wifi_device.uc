@@ -3,6 +3,7 @@ import * as wifi_opclass from "wifi_opclass";
 
 const band_names = { "0": "2g", "1": "5g", "3": "6g" };
 const iftype_names = { "managed": "sta", "ap": "ap", "ibss": "adhoc", "mesh_point": "mesh", "monitor": "monitor", "p2p_client": "p2p_client", "p2p_go": "p2p_go" };
+const iftype_num_names = { "2": "sta", "3": "ap", "7": "mesh" };
 const MAX_AGE = 600;
 
 function to_hex(arr) {
@@ -71,6 +72,54 @@ function vht_mcs_to_hex(mcs) {
 	       int_to_hex(mcs.tx_highest_data_rate ?? 0, 2);
 }
 
+function he_mcs_to_hex(mcs) {
+	if (!mcs || !length(mcs))
+		return "";
+
+	// HE MCS-NSS Support field: per bandwidth (80, 160, 80+80)
+	// each has 4 bytes: 2 bytes Rx MCS map + 2 bytes Tx MCS map
+	// 2 bits per stream: 0=MCS0-7, 1=MCS0-9, 2=MCS0-11, 3=not supported
+	let s = "";
+	for (let bw_entry in mcs) {
+		let rx_map = 0xffff, tx_map = 0xffff;
+
+		for (let entry in bw_entry.rx_mcs_set) {
+			let ns = entry.streams - 1;
+			let max_mcs = entry.mcs_indexes[length(entry.mcs_indexes) - 1];
+			let val = (max_mcs >= 10) ? 2 : (max_mcs >= 8) ? 1 : 0;
+			rx_map = (rx_map & ~(3 << (ns * 2))) | (val << (ns * 2));
+		}
+		for (let entry in bw_entry.tx_mcs_set) {
+			let ns = entry.streams - 1;
+			let max_mcs = entry.mcs_indexes[length(entry.mcs_indexes) - 1];
+			let val = (max_mcs >= 10) ? 2 : (max_mcs >= 8) ? 1 : 0;
+			tx_map = (tx_map & ~(3 << (ns * 2))) | (val << (ns * 2));
+		}
+
+		s += int_to_hex(rx_map, 2) + int_to_hex(tx_map, 2);
+	}
+	return s;
+}
+
+function popcount(v) {
+	let c = 0;
+	while (v) { c += v & 1; v >>= 1; }
+	return c;
+}
+
+function he_ppe_to_hex(ppe) {
+	if (!ppe || !length(ppe) || !ppe[0])
+		return "";
+
+	// PPE Thresholds: 7-bit header + (NSTS+1) * popcount(RU_bitmask) * 6 bits
+	let nsts = ppe[0] & 0x7;
+	let ru_bitmask = (ppe[0] >> 3) & 0xf;
+	let total_bits = 7 + (nsts + 1) * popcount(ru_bitmask) * 6;
+	let total_bytes = (total_bits + 7) >> 3;
+
+	return to_hex(slice(ppe, 0, total_bytes));
+}
+
 // Find the best netdev on a phy for scanning: prefer station, then any other.
 // Filter by band frequencies to pick an interface on the correct radio.
 function find_scan_dev(wiphy, freq_set) {
@@ -116,10 +165,18 @@ function get_wiphy_bands() {
 	// and filter by our wiphy index
 	let parts = type(r) == "array" ? r : [ r ];
 	let bands = {};
+	let iftype_ext_capa = {};
 
 	for (let part in parts) {
 		if (part.wiphy != null && part.wiphy != this.wiphy)
 			continue;
+
+		if (part.iftype_ext_capa) {
+			for (let entry in part.iftype_ext_capa) {
+				let name = iftype_num_names[entry.iftype] ?? entry.iftype;
+				iftype_ext_capa[name] = entry;
+			}
+		}
 
 		if (!part.wiphy_bands)
 			continue;
@@ -171,6 +228,7 @@ function get_wiphy_bands() {
 		}
 	}
 
+	this.iftype_ext_capa = iftype_ext_capa;
 	return bands;
 }
 
@@ -237,8 +295,8 @@ function get_status() {
 				caps.he = {
 					phy_caps: to_hex(itd.he_cap_phy),
 					mac_caps: to_hex(itd.he_cap_mac),
-					mcs: to_hex(itd.he_cap_mcs_set_raw ?? []),
-					ppe: to_hex(itd.he_cap_ppe ?? []),
+					mcs: he_mcs_to_hex(itd.he_cap_mcs_set),
+					ppe: he_ppe_to_hex(itd.he_cap_ppe),
 				};
 			}
 			if (itd.eht_cap_phy) {
@@ -248,6 +306,14 @@ function get_status() {
 					mcs: to_hex(itd.eht_cap_mcs_set ?? []),
 					ppe: to_hex(itd.eht_cap_ppe ?? []),
 				};
+			}
+
+			let ext = this.iftype_ext_capa?.[name];
+			if (ext) {
+				if (ext.eml_capability != null)
+					caps.eml_capability = int_to_hex(ext.eml_capability, 2);
+				if (ext.mld_capa_and_ops != null)
+					caps.mld_capa_and_ops = int_to_hex(ext.mld_capa_and_ops, 2);
 			}
 
 			status[name + "_caps"] = caps;
