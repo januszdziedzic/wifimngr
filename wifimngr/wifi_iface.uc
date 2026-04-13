@@ -132,8 +132,11 @@ function get_status(cursor) {
 				status.hidden = hinfo._hidden;
 			delete hinfo._state;
 			delete hinfo._hidden;
-			for (let k in hinfo)
+			for (let k in hinfo) {
+				if (r.mlo_links != null && k == "caps")
+					continue;
 				status[k] = hinfo[k];
+			}
 		}
 	} else {
 		if (netdev_operstate(this.ifname) == "up")
@@ -142,8 +145,18 @@ function get_status(cursor) {
 
 	if (r.mlo_links != null) {
 		let links = [];
-		for (let link in r.mlo_links)
-			push(links, format_mlo_link(link));
+		for (let link in r.mlo_links) {
+			let out = format_mlo_link(link);
+			if (r.iftype == nl80211.const.NL80211_IFTYPE_AP) {
+				let beacon = hostapd.dump_beacon(this.ifname, link.link_id);
+				if (beacon) {
+					let caps = hostapd.beacon_caps(beacon);
+					if (length(caps))
+						out.caps = caps;
+				}
+			}
+			push(links, out);
+		}
 		status.mlo_links = links;
 	}
 

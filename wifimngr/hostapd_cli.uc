@@ -85,8 +85,11 @@ function encryption(cfg) {
 }
 
 // Fetch a live beacon as a hex string via `hostapd_cli raw DUMP_BEACON`.
-function dump_beacon(ifname) {
-	let hex = run(ifname, "raw DUMP_BEACON");
+function dump_beacon(ifname, link_id) {
+	let cmd = (link_id != null)
+		? `raw "LINKID ${link_id} DUMP_BEACON"`
+		: "raw DUMP_BEACON";
+	let hex = run(ifname, cmd);
 	if (!hex || length(hex) < 76)
 		return null;
 	return hex;
