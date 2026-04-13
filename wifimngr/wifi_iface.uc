@@ -51,7 +51,7 @@ const iftype_map = {
 	[nl80211.const.NL80211_IFTYPE_P2P_GO]: "p2p_go",
 };
 
-const bw_map = { "0": 20, "1": 20, "2": 40, "3": 80, "4": 8080, "5": 160, "8": 320 };
+const bw_map = { "0": 20, "1": 20, "2": 40, "3": 80, "4": 8080, "5": 160, "6": 5, "7": 10, "13": 320 };
 
 function freq_to_chan(freq) {
 	if (freq == null)
@@ -136,34 +136,53 @@ function sta_standard(flags, freq) {
 	let is_2g = (freq && freq < 3000);
 	let is_6g = (freq && freq > 5935);
 	let parts = [];
-	if (is_2g)
-		push(parts, "802.11b/g");
-	else
-		push(parts, "802.11a");
-	if (index(flags, "[HT]") >= 0)
-		push(parts, "n");
-	if (index(flags, "[VHT]") >= 0)
-		push(parts, "ac");
-	if (index(flags, "[HE]") >= 0)
-		push(parts, "ax");
-	if (index(flags, "[EHT]") >= 0)
-		push(parts, "be");
+	if (is_6g) {
+		if (index(flags, "[HE]") >= 0)
+			push(parts, "802.11ax");
+		if (index(flags, "[EHT]") >= 0)
+			push(parts, "be");
+	} else {
+		if (is_2g)
+			push(parts, "802.11b/g");
+		else
+			push(parts, "802.11a");
+		if (index(flags, "[HT]") >= 0)
+			push(parts, "n");
+		if (index(flags, "[VHT]") >= 0)
+			push(parts, "ac");
+		if (index(flags, "[HE]") >= 0)
+			push(parts, "ax");
+		if (index(flags, "[EHT]") >= 0)
+			push(parts, "be");
+	}
 	return join("/", parts);
 }
 
 function sta_bandwidth(data) {
+	let bw = 20;
+
+	if (data.ht_caps_info) {
+		let ht = +data.ht_caps_info;
+		if (ht & 2) bw = 40;
+	}
 	if (data.vht_caps_info) {
 		let vht = +data.vht_caps_info;
 		let chw = (vht >> 2) & 3;
-		if (chw) return 160;
-		return 80;
+		bw = chw ? 160 : 80;
 	}
-	if (data.ht_caps_info) {
-		let ht = +data.ht_caps_info;
-		if (ht & 2) return 40;
-		return 20;
+	if (data.he_capab && length(data.he_capab) >= 34) {
+		// HE PHY byte 0 starts at offset 12 (mac=6B)
+		let phy0 = +("0x" + substr(data.he_capab, 12, 2));
+		if (phy0 & 0x08) bw = 160;
+		else if (phy0 & 0x04) bw = 80;
+		else if (phy0 & 0x02) bw = 40;
 	}
-	return 20;
+	if (data.eht_capab && length(data.eht_capab) >= 8) {
+		// EHT PHY byte 0 starts at offset 4 (mac=2B)
+		let ephy0 = +("0x" + substr(data.eht_capab, 4, 2));
+		if (ephy0 & 0x02) bw = 320;
+	}
+	return bw;
 }
 
 function get_status(cursor) {
@@ -257,6 +276,119 @@ function ubus_methods(cursor) {
 					return;
 				}
 				req.reply(s);
+			}
+		},
+		blocked_stas: {
+			call: function(req) {
+				let data = hostapd.run_cmd(self.ifname, 'raw DENY_ACL SHOW');
+				let macs = [];
+				if (data) {
+					for (let line in split(data, "\n")) {
+						line = trim(line);
+						if (match(line, /^[0-9a-fA-F:]{17}/))
+							push(macs, substr(line, 0, 17));
+					}
+				}
+				req.reply({ blocked_stas: macs });
+			}
+		},
+		block_sta: {
+			args: { sta: "", block: 0 },
+			call: function(req) {
+				let sta = req.args?.sta;
+				let block = req.args?.block ?? 1;
+				if (!sta) {
+					req.reply({ error: "sta required" });
+					return;
+				}
+				let cmd = block
+					? `raw DENY_ACL ADD_MAC ${sta}`
+					: `raw DENY_ACL DEL_MAC ${sta}`;
+				let ret = hostapd.run_cmd(self.ifname, cmd);
+				req.reply({ status: ret ? "ok" : "fail" });
+			}
+		},
+		list_neighbor: {
+			call: function(req) {
+				let data = hostapd.run_cmd(self.ifname, "show_neighbor");
+				let nbrs = [];
+				if (data) {
+					for (let line in split(data, "\n")) {
+						let m = match(line, /nr=([0-9a-fA-F]+)/);
+						if (!m || length(m[1]) < 26)
+							continue;
+						let nr = m[1];
+						let bssid = sprintf("%s:%s:%s:%s:%s:%s",
+							substr(nr, 0, 2), substr(nr, 2, 2),
+							substr(nr, 4, 2), substr(nr, 6, 2),
+							substr(nr, 8, 2), substr(nr, 10, 2));
+						let bi = +("0x" + substr(nr, 12, 2))
+							| (+("0x" + substr(nr, 14, 2)) << 8)
+							| (+("0x" + substr(nr, 16, 2)) << 16)
+							| (+("0x" + substr(nr, 18, 2)) << 24);
+						push(nbrs, {
+							bssid,
+							bssid_info: sprintf("0x%x", bi),
+							reg: +("0x" + substr(nr, 20, 2)),
+							channel: +("0x" + substr(nr, 22, 2)),
+							phy: +("0x" + substr(nr, 24, 2)),
+						});
+					}
+				}
+				req.reply({ neighbors: nbrs });
+			}
+		},
+		add_neighbor: {
+			args: { bssid: "", channel: 0, bssid_info: "", reg: 0, phy: 0 },
+			call: function(req) {
+				let a = req.args;
+				if (!a?.bssid) {
+					req.reply({ error: "bssid required" });
+					return;
+				}
+				// Build nr= hex: bssid(6B) + bssid_info(4B LE) + reg(1B) + channel(1B) + phy(1B)
+				let nr = replace(a.bssid, /:/g, "");
+				let bi = +(a.bssid_info ?? 0);
+				nr += sprintf("%02x%02x%02x%02x", bi & 0xff, (bi >> 8) & 0xff,
+					(bi >> 16) & 0xff, (bi >> 24) & 0xff);
+				nr += sprintf("%02x", +(a.reg ?? 0));
+				nr += sprintf("%02x", +(a.channel ?? 0));
+				nr += sprintf("%02x", +(a.phy ?? 0));
+				// Get SSID from hostapd status
+				let st = hostapd.status(self.ifname);
+				let ssid = st?.ssid?.[0] || "";
+				let cmd = `set_neighbor ${a.bssid} ssid="${ssid}" nr=${nr}`;
+				let ret = hostapd.run_cmd(self.ifname, cmd);
+				req.reply({ status: ret ? "ok" : "fail" });
+			}
+		},
+		del_neighbor: {
+			args: { bssid: "" },
+			call: function(req) {
+				let bssid = req.args?.bssid;
+				if (!bssid) {
+					req.reply({ error: "bssid required" });
+					return;
+				}
+				let st = hostapd.status(self.ifname);
+				let ssid = st?.ssid?.[0] || "";
+				let cmd = `remove_neighbor ${bssid} ssid="${ssid}"`;
+				let ret = hostapd.run_cmd(self.ifname, cmd);
+				req.reply({ status: ret ? "ok" : "fail" });
+			}
+		},
+		disconnect: {
+			args: { sta: "String", reason: 0 },
+			call: function(req) {
+				let sta = req.args?.sta;
+				let reason = req.args?.reason ?? 1;
+				if (!sta) {
+					req.reply({ error: "sta required" });
+					return;
+				}
+				let ret = hostapd.run_cmd(self.ifname,
+					`deauthenticate ${sta} reason=${reason}`);
+				req.reply({ status: ret ? "ok" : "fail" });
 			}
 		},
 		assoclist: {

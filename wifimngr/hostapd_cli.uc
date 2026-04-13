@@ -325,6 +325,7 @@ function sta_caps(data) {
 }
 
 export default {
+	run_cmd: run,
 	kv,
 	get_config,
 	status,
