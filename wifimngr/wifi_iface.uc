@@ -89,6 +89,83 @@ function format_mlo_link(link) {
 	return out;
 }
 
+function get_noise(ifname) {
+	let r = nl80211.request(
+		nl80211.const.NL80211_CMD_GET_SURVEY,
+		nl80211.const.NLM_F_DUMP, { dev: ifname }
+	);
+	if (!r) return null;
+	let parts = type(r) == "array" ? r : [ r ];
+	for (let p in parts) {
+		if (p.survey_info?.in_use && p.survey_info?.noise != null)
+			return p.survey_info.noise;
+	}
+	return null;
+}
+
+function nss_from_vht_mcs_map(map_hex) {
+	let map = +("0x" + map_hex);
+	let nss = 0;
+	for (let i = 0; i < 8; i++) {
+		if (((map >> (i * 2)) & 3) != 3)
+			nss = i + 1;
+	}
+	return nss;
+}
+
+function nss_from_ht_mcs(mcs_hex) {
+	let nss = 0;
+	for (let i = 0; i < 4; i++) {
+		let byte = +("0x" + substr(mcs_hex, i * 2, 2));
+		if (byte)
+			nss = i + 1;
+	}
+	return nss;
+}
+
+function sta_nss(data) {
+	if (data.rx_vht_mcs_map)
+		return nss_from_vht_mcs_map(data.rx_vht_mcs_map);
+	if (data.ht_mcs_bitmask)
+		return nss_from_ht_mcs(data.ht_mcs_bitmask);
+	return null;
+}
+
+function sta_standard(flags, freq) {
+	if (!flags) return null;
+	let is_2g = (freq && freq < 3000);
+	let is_6g = (freq && freq > 5935);
+	let parts = [];
+	if (is_2g)
+		push(parts, "802.11b/g");
+	else
+		push(parts, "802.11a");
+	if (index(flags, "[HT]") >= 0)
+		push(parts, "n");
+	if (index(flags, "[VHT]") >= 0)
+		push(parts, "ac");
+	if (index(flags, "[HE]") >= 0)
+		push(parts, "ax");
+	if (index(flags, "[EHT]") >= 0)
+		push(parts, "be");
+	return join("/", parts);
+}
+
+function sta_bandwidth(data) {
+	if (data.vht_caps_info) {
+		let vht = +data.vht_caps_info;
+		let chw = (vht >> 2) & 3;
+		if (chw) return 160;
+		return 80;
+	}
+	if (data.ht_caps_info) {
+		let ht = +data.ht_caps_info;
+		if (ht & 2) return 40;
+		return 20;
+	}
+	return 20;
+}
+
 function get_status(cursor) {
 	let r = nl80211.request(
 		nl80211.const.NL80211_CMD_GET_INTERFACE, 0,
@@ -180,6 +257,69 @@ function ubus_methods(cursor) {
 					return;
 				}
 				req.reply(s);
+			}
+		},
+		assoclist: {
+			call: function(req) {
+				let macs = hostapd.list_stas(self.ifname);
+				req.reply({ assoclist: macs });
+			}
+		},
+		stations: {
+			call: function(req) {
+				let macs = hostapd.list_stas(self.ifname);
+				let noise = get_noise(self.ifname);
+				let iface = nl80211.request(
+					nl80211.const.NL80211_CMD_GET_INTERFACE, 0,
+					{ dev: self.ifname }
+				);
+				let freq = iface?.wiphy_freq;
+				let stas = [];
+				for (let mac in macs) {
+					let data = hostapd.sta_info(self.ifname, mac);
+					if (!data)
+						continue;
+					let rssi = data.signal ? +data.signal : null;
+					let sta = { mac };
+					if (data.aid)
+						sta.aid = +data.aid;
+					let nss = sta_nss(data);
+					if (nss)
+						sta.nss = nss;
+					let sta_bw = sta_bandwidth(data);
+					let ap_bw = bw_map[iface?.channel_width] ?? 20;
+					sta.bandwidth = (sta_bw < ap_bw) ? sta_bw : ap_bw;
+					if (rssi != null)
+						sta.rssi = rssi;
+					if (noise != null)
+						sta.noise = noise;
+					if (rssi != null && noise != null)
+						sta.snr = rssi - noise;
+					let std = sta_standard(data.flags, freq);
+					if (std)
+						sta.standard = std;
+					if (data.connected_time)
+						sta.connected_time = +data.connected_time;
+					if (data.inactive_msec)
+						sta.inactive_msec = +data.inactive_msec;
+					if (data.rx_bytes)
+						sta.rx_bytes = +data.rx_bytes;
+					if (data.tx_bytes)
+						sta.tx_bytes = +data.tx_bytes;
+					if (data.rx_packets)
+						sta.rx_packets = +data.rx_packets;
+					if (data.tx_packets)
+						sta.tx_packets = +data.tx_packets;
+					if (data.rx_rate_info)
+						sta.rx_rate = +data.rx_rate_info;
+					if (data.tx_rate_info)
+						sta.tx_rate = +data.tx_rate_info;
+					let caps = hostapd.sta_caps(data);
+					if (length(caps))
+						sta.caps = caps;
+					push(stas, sta);
+				}
+				req.reply({ stations: stas });
 			}
 		},
 	};

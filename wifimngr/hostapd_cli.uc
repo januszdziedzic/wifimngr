@@ -251,6 +251,79 @@ function hidden(ifname) {
 	return beacon_hidden(dump_beacon(ifname));
 }
 
+function list_stas(ifname) {
+	let data = run(ifname, "list");
+	if (!data)
+		return [];
+	let macs = [];
+	for (let line in split(data, "\n")) {
+		line = trim(line);
+		if (match(line, /^[0-9a-fA-F:]{17}$/))
+			push(macs, line);
+	}
+	return macs;
+}
+
+function sta_info(ifname, mac) {
+	return kv(ifname, `sta ${mac}`);
+}
+
+// Convert 0xNNNN to little-endian hex string of `bytes` length
+function int_to_le_hex(val, bytes) {
+	let s = "";
+	for (let i = 0; i < bytes; i++) {
+		s += sprintf("%02x", (val >> (i * 8)) & 0xff);
+	}
+	return s;
+}
+
+// Parse station caps from hostapd_cli sta kv output into structured format
+// matching AP beacon caps.
+function sta_caps(data) {
+	if (!data)
+		return {};
+	let out = {};
+
+	if (data.ht_caps_info) {
+		let caps_val = +data.ht_caps_info;
+		let mcs = data.ht_mcs_bitmask || "";
+		// Pad mcs to 16 bytes (32 hex chars)
+		while (length(mcs) < 32)
+			mcs += "0";
+		out.ht = {
+			caps: int_to_le_hex(caps_val, 2),
+			mcs,
+		};
+	}
+
+	if (data.vht_capab) {
+		// vht_capab = caps(4B LE) + mcs(8B)
+		out.vht = {
+			caps: hex_slice(data.vht_capab, 0, 4),
+			mcs: hex_slice(data.vht_capab, 4, 8),
+		};
+	}
+
+	let he_phy0 = null;
+	if (data.he_capab) {
+		// he_capab = mac(6B) + phy(11B) + mcs + ppe
+		let he = parse_he(data.he_capab);
+		if (he) {
+			out.he = he;
+			he_phy0 = hex_byte(he.phy_caps, 0);
+		}
+	}
+
+	if (data.eht_capab) {
+		// eht_capab = mac(2B) + phy(9B) + mcs + ppe
+		let eht = parse_eht(data.eht_capab, he_phy0);
+		if (eht)
+			out.eht = eht;
+	}
+
+	return out;
+}
+
 export default {
 	kv,
 	get_config,
@@ -261,4 +334,7 @@ export default {
 	beacon_hidden,
 	beacon_caps,
 	hidden,
+	list_stas,
+	sta_info,
+	sta_caps,
 };
