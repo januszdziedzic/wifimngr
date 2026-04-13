@@ -4,7 +4,7 @@ import * as ubus from "ubus";
 import * as uloop from "uloop";
 import * as uci from "uci";
 import * as nl80211 from "nl80211";
-import { readfile } from "fs";
+import { readfile, realpath, lsdir } from "fs";
 import * as wifi_iface from "wifi_iface";
 import * as wifi_device from "wifi_device";
 
@@ -14,37 +14,74 @@ let cursor = uci.cursor();
 let published = {};
 let reload_timer;
 
-// Parse network.wireless status into ifname and wiphy maps
-function get_wireless_status() {
+// Resolve phy name from UCI option path by matching against
+// /sys/class/ieee80211/*/device symlinks (same logic as C wifimngr)
+function phy_from_path(path) {
+	let prefix = "platform/";
+	let phys = lsdir("/sys/class/ieee80211");
+	if (!phys)
+		return null;
+
+	for (let phy in phys) {
+		let link = realpath(`/sys/class/ieee80211/${phy}/device`);
+		if (!link)
+			continue;
+
+		// Normalize: strip /sys/devices/ prefix
+		let devprefix = "/sys/devices/";
+		if (substr(link, 0, length(devprefix)) == devprefix)
+			link = substr(link, length(devprefix));
+
+		// Strip platform/ prefix if path contains /pci (like netifd does)
+		if (substr(link, 0, length(prefix)) == prefix && index(link, "/pci") >= 0)
+			link = substr(link, length(prefix));
+
+		if (link == path)
+			return phy;
+	}
+	return null;
+}
+
+// Get wiphy index from phy name via sysfs
+function phy_to_wiphy(phyname) {
+	let idx = readfile(`/sys/class/ieee80211/${phyname}/index`);
+	if (idx == null)
+		return null;
+	return +trim(idx);
+}
+
+// Resolve a wifi-device UCI section to { phy, wiphy, band }
+function resolve_radio(s) {
+	let phyname = s.phy;
+
+	if (!phyname && s.path)
+		phyname = phy_from_path(s.path);
+
+	// Default: try section name as phy name
+	if (!phyname)
+		phyname = s[".name"];
+
+	let wiphy = phy_to_wiphy(phyname);
+	if (wiphy == null)
+		return null;
+
+	return { phy: phyname, wiphy, band: s.band };
+}
+
+// Parse network.wireless status to get ifname mapping for wifi-iface sections
+function get_iface_names() {
 	let status = conn.call("network.wireless", "status");
 	if (!status)
-		return { ifnames: {}, wiphys: {} };
+		return {};
 
 	let ifnames = {};
-	let radios = {};
-
 	for (let radio, rdata in status) {
-		let info = { band: rdata.config?.band };
-
-		// Get wiphy from first interface on this radio
 		for (let iface in rdata.interfaces) {
 			if (iface.section && iface.ifname)
 				ifnames[iface.section] = iface.ifname;
-
-			if (info.wiphy == null && iface.ifname) {
-				let r = nl80211.request(
-					nl80211.const.NL80211_CMD_GET_INTERFACE, 0,
-					{ dev: iface.ifname }
-				);
-				if (r)
-					info.wiphy = r.wiphy;
-			}
 		}
-
-		radios[radio] = info;
 	}
-
-	return { ifnames, radios };
+	return ifnames;
 }
 
 // Resolve ifindex to ifname
@@ -99,15 +136,19 @@ function publish_entries() {
 	}
 
 	cursor.load("wireless");
-	let ws = get_wireless_status();
 
 	// Register wifi.radio.X for each wifi-device
+	// Resolve phy from UCI option phy/path via sysfs - no live interfaces needed
 	cursor.foreach("wireless", "wifi-device", function(s) {
 		let name = s[".name"];
-		let info = ws.radios[name];
 
-		if (!info || info.wiphy == null) {
-			printf("wifimngr: no wiphy for %s, skipping\n", name);
+		if (s.disabled == "1")
+			return;
+
+		let info = resolve_radio(s);
+
+		if (!info) {
+			printf("wifimngr: no phy for %s, skipping\n", name);
 			return;
 		}
 
@@ -115,15 +156,21 @@ function publish_entries() {
 		let obj_name = "wifi.radio." + name;
 		published[obj_name] = conn.publish(obj_name, dev.ubus_methods(cursor));
 
-		printf("wifimngr: registered %s (wiphy=%d, band=%s)\n", obj_name, info.wiphy, info.band);
+		printf("wifimngr: registered %s (phy=%s, wiphy=%d, band=%s)\n",
+			obj_name, info.phy, info.wiphy, info.band);
 	});
 
 	// Register wifi.ap.X or wifi.sta.X using real ifname
+	let ifnames = get_iface_names();
+
 	cursor.foreach("wireless", "wifi-iface", function(s) {
+		if (s.disabled == "1")
+			return;
+
 		let section = s[".name"];
 		let mode = s.mode || "ap";
 		let prefix = (mode == "sta") ? "wifi.sta." : "wifi.ap.";
-		let ifname = s.ifname || ws.ifnames[section];
+		let ifname = s.ifname || ifnames[section];
 
 		if (!ifname) {
 			printf("wifimngr: no ifname for %s, skipping\n", section);
@@ -150,10 +197,8 @@ function schedule_reload() {
 	});
 }
 
-// Initial publish
-publish_entries();
-
-// Listen for wireless config changes
+// Register event listeners before initial publish so we don't miss
+// netifd.wireless.done if it fires during startup.
 conn.listener("config.change", (event, msg) => {
 	if (msg.config == "wireless") {
 		printf("wifimngr: wireless config changed\n");
@@ -161,16 +206,21 @@ conn.listener("config.change", (event, msg) => {
 	}
 });
 
-// Listen for netifd wireless setup done
 conn.listener("netifd.wireless.done", () => {
 	printf("wifimngr: wireless setup done\n");
 	schedule_reload();
 });
 
-// SIGHUP handler
 uloop.signal("SIGHUP", () => {
 	printf("wifimngr: SIGHUP received\n");
 	schedule_reload();
 });
+
+// Initial publish
+publish_entries();
+
+// Deferred retry in case wireless interfaces weren't ready yet
+// (netifd.wireless.done may have fired before we started).
+schedule_reload();
 
 uloop.run();
