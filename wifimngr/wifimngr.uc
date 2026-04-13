@@ -10,6 +10,7 @@ import * as wifi_device from "wifi_device";
 
 uloop.init();
 let conn = ubus.connect();
+let event_conn = ubus.connect();
 let cursor = uci.cursor();
 let published = {};
 let reload_timer;
@@ -199,16 +200,25 @@ function schedule_reload() {
 
 // Register event listeners before initial publish so we don't miss
 // netifd.wireless.done if it fires during startup.
-conn.listener("config.change", (event, msg) => {
+event_conn.listener("config.change", (event, msg) => {
 	if (msg.config == "wireless") {
 		printf("wifimngr: wireless config changed\n");
 		schedule_reload();
 	}
 });
 
-conn.listener("netifd.wireless.done", () => {
-	printf("wifimngr: wireless setup done\n");
-	schedule_reload();
+event_conn.listener("ubus.object.add", (event, msg) => {
+	if (msg.path && substr(msg.path, 0, 8) == "hostapd.") {
+		printf("wifimngr: hostapd object added: %s\n", msg.path);
+		schedule_reload();
+	}
+});
+
+event_conn.listener("ubus.object.remove", (event, msg) => {
+	if (msg.path && substr(msg.path, 0, 8) == "hostapd.") {
+		printf("wifimngr: hostapd object removed: %s\n", msg.path);
+		schedule_reload();
+	}
 });
 
 uloop.signal("SIGHUP", () => {
@@ -219,8 +229,9 @@ uloop.signal("SIGHUP", () => {
 // Initial publish
 publish_entries();
 
-// Deferred retry in case wireless interfaces weren't ready yet
-// (netifd.wireless.done may have fired before we started).
-schedule_reload();
+// If hostapd objects already exist, reload to pick up interfaces
+let objs = event_conn.list("hostapd.*");
+if (objs && length(objs))
+	schedule_reload();
 
 uloop.run();
