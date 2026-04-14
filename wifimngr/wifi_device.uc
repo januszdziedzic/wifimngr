@@ -196,7 +196,7 @@ function get_wiphy_bands() {
 					dfs: !!freq.radar,
 				};
 				if (freq.radar) {
-					const dfs_states = [ "usable", "available", "unavailable" ];
+					const dfs_states = [ "usable", "unavailable", "available" ];
 					fi.dfs_state = dfs_states[freq.dfs_state] ?? "unknown";
 					// Weather radar band (5600-5650 MHz) requires 10min CAC
 					fi.cac_time = (freq.freq >= 5600 && freq.freq <= 5650) ? 600 : 60;

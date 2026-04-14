@@ -377,6 +377,92 @@ function ubus_methods(cursor) {
 				req.reply({ status: ret ? "ok" : "fail" });
 			}
 		},
+		request_neighbor: {
+			args: { client: "", opclass: 0, channel: 0, duration: 0,
+				mode: "", bssid: "", reporting_detail: 0, ssid: "",
+				channel_report: [], request_element: [] },
+			call: function(req) {
+				let a = req.args;
+				if (!a?.client) {
+					req.reply({ error: "client required" });
+					return;
+				}
+				// Build beacon request hex:
+				// opclass(1B) + channel(1B) + rand_interval(2B LE) + duration(2B LE) + mode(1B) + bssid(6B) + subelements
+				let opclass = +(a.opclass ?? 0);
+				let channel = +(a.channel ?? 0);
+				let duration = +(a.duration ?? 100);
+				let mode_str = a.mode ?? "passive";
+				let mode = (mode_str == "active") ? 1 : (mode_str == "table") ? 2 : 0;
+				let bssid = a.bssid ? replace(a.bssid, /:/g, "") : "ffffffffffff";
+				let hex = sprintf("%02x%02x0000%02x%02x%02x%s",
+					opclass, channel,
+					duration & 0xff, (duration >> 8) & 0xff,
+					mode, bssid);
+				// SSID subelement (id=0)
+				if (a.ssid != null && a.ssid != "") {
+					let ssid_hex = "";
+					for (let i = 0; i < length(a.ssid); i++)
+						ssid_hex += sprintf("%02x", ord(a.ssid, i));
+					hex += sprintf("00%02x%s", length(a.ssid), ssid_hex);
+				}
+				// Reporting Detail subelement (id=2)
+				if (a.reporting_detail != null)
+					hex += sprintf("02%02x%02x", 1, +(a.reporting_detail));
+				// Channel Report subelement (id=51)
+				if (a.channel_report && length(a.channel_report)) {
+					for (let cr in a.channel_report)
+						hex += sprintf("33%02x%s", length(cr) / 2, cr);
+				}
+				// Request Element subelement (id=10)
+				if (a.request_element && length(a.request_element)) {
+					let elems = "";
+					for (let e in a.request_element)
+						elems += sprintf("%02x", +e);
+					hex += sprintf("0a%02x%s", length(a.request_element), elems);
+				}
+				let cmd = `req_beacon ${a.client} ${hex}`;
+				hostapd.run_cmd(self.ifname, cmd);
+				req.reply({ status: "ok" });
+			}
+		},
+		request_btm: {
+			args: { sta: "", target_ap: [], mode: 0, disassoc_tmo: 0,
+				validity_int: 0, dialog_token: 0, bssterm_dur: 0,
+				mbo_reason: 0, mbo_cell_pref: 0, mbo_reassoc_delay: 0 },
+			call: function(req) {
+				let a = req.args;
+				if (!a?.sta) {
+					req.reply({ error: "sta required" });
+					return;
+				}
+				let cmd = `bss_tm_req ${a.sta}`;
+				// Add neighbor targets
+				if (a.target_ap) {
+					for (let ap in a.target_ap)
+						cmd += ` neighbor=${ap}`;
+				}
+				let mode = +(a.mode ?? 0);
+				if (mode & 0x01)
+					cmd += " pref=1";
+				if (mode & 0x04)
+					cmd += " disassoc_imminent=1";
+				if (mode & 0x02)
+					cmd += " abridged=1";
+				if (a.disassoc_tmo)
+					cmd += ` disassoc_timer=${a.disassoc_tmo}`;
+				if (a.validity_int)
+					cmd += ` valid_int=${a.validity_int}`;
+				if (a.dialog_token)
+					cmd += ` dialog_token=${a.dialog_token}`;
+				if (a.bssterm_dur)
+					cmd += ` bss_term=0,${a.bssterm_dur}`;
+				if (a.mbo_reason || a.mbo_cell_pref || a.mbo_reassoc_delay)
+					cmd += ` mbo=${a.mbo_reason ?? 0}:${a.mbo_reassoc_delay ?? 0}:${a.mbo_cell_pref ?? 0}`;
+				let ret = hostapd.run_cmd(self.ifname, cmd);
+				req.reply({ status: ret ? "ok" : "fail" });
+			}
+		},
 		disconnect: {
 			args: { sta: "String", reason: 0 },
 			call: function(req) {
