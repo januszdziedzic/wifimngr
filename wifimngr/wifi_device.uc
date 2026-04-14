@@ -276,47 +276,55 @@ function get_status() {
 		if (length(band.bitrates))
 			status.bitrates = band.bitrates;
 
-		for (let name, itd in band.iftype_data) {
-			let caps = {};
+		// HT/VHT are band-level caps (always present if supported)
+		let base_caps = {};
+		if (band.ht_capa != null) {
+			base_caps.ht = {
+				caps: int_to_hex(band.ht_capa, 2),
+				mcs: ht_mcs_to_hex(band.ht_mcs_set),
+			};
+		}
+		if (band.vht_capa != null) {
+			base_caps.vht = {
+				caps: int_to_hex(band.vht_capa, 4),
+				mcs: vht_mcs_to_hex(band.vht_mcs_set),
+			};
+		}
 
-			if (band.ht_capa != null) {
-				caps.ht = {
-					caps: int_to_hex(band.ht_capa, 2),
-					mcs: ht_mcs_to_hex(band.ht_mcs_set),
-				};
-			}
-			if (band.vht_capa != null) {
-				caps.vht = {
-					caps: int_to_hex(band.vht_capa, 4),
-					mcs: vht_mcs_to_hex(band.vht_mcs_set),
-				};
-			}
-			if (itd.he_cap_phy) {
-				caps.he = {
-					phy_caps: to_hex(itd.he_cap_phy),
-					mac_caps: to_hex(itd.he_cap_mac),
-					mcs: he_mcs_to_hex(itd.he_cap_mcs_set),
-					ppe: he_ppe_to_hex(itd.he_cap_ppe),
-				};
-			}
-			if (itd.eht_cap_phy) {
-				caps.eht = {
-					phy_caps: to_hex(itd.eht_cap_phy),
-					mac_caps: to_hex(itd.eht_cap_mac),
-					mcs: to_hex(itd.eht_cap_mcs_set ?? []),
-					ppe: to_hex(itd.eht_cap_ppe ?? []),
-				};
-			}
+		// HE/EHT are per-iftype (from iftype_data)
+		if (band.iftype_data && length(band.iftype_data)) {
+			for (let name, itd in band.iftype_data) {
+				let caps = { ...base_caps };
 
-			let ext = this.iftype_ext_capa?.[name];
-			if (ext) {
-				if (ext.eml_capability != null)
-					caps.eml_capability = int_to_hex(ext.eml_capability, 2);
-				if (ext.mld_capa_and_ops != null)
-					caps.mld_capa_and_ops = int_to_hex(ext.mld_capa_and_ops, 2);
-			}
+				if (itd.he_cap_phy) {
+					caps.he = {
+						phy_caps: to_hex(itd.he_cap_phy),
+						mac_caps: to_hex(itd.he_cap_mac),
+						mcs: he_mcs_to_hex(itd.he_cap_mcs_set),
+						ppe: he_ppe_to_hex(itd.he_cap_ppe),
+					};
+				}
+				if (itd.eht_cap_phy) {
+					caps.eht = {
+						phy_caps: to_hex(itd.eht_cap_phy),
+						mac_caps: to_hex(itd.eht_cap_mac),
+						mcs: to_hex(itd.eht_cap_mcs_set ?? []),
+						ppe: to_hex(itd.eht_cap_ppe ?? []),
+					};
+				}
 
-			status[name + "_caps"] = caps;
+				let ext = this.iftype_ext_capa?.[name];
+				if (ext) {
+					if (ext.eml_capability != null)
+						caps.eml_capability = int_to_hex(ext.eml_capability, 2);
+					if (ext.mld_capa_and_ops != null)
+						caps.mld_capa_and_ops = int_to_hex(ext.mld_capa_and_ops, 2);
+				}
+
+				status[name + "_caps"] = caps;
+			}
+		} else if (length(base_caps)) {
+			status.caps = base_caps;
 		}
 		break;
 	}
