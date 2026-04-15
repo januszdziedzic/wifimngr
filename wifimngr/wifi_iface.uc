@@ -529,6 +529,8 @@ function ubus_methods(cursor) {
 					if (nlsta?.mld_addr)
 						sta.mld_addr = nlsta.mld_addr;
 					// Collect per-link peer addresses from peer_addr[N]
+					// and query each link's BSS for per-link caps via
+					// hostapd_cli -i <ifname>_link<N>.
 					let sta_links = [];
 					for (let k in data) {
 						let m = match(k, /^peer_addr\[([0-9]+)\]$/);
@@ -540,26 +542,53 @@ function ubus_methods(cursor) {
 							entry.bssid = li.bssid;
 							entry.frequency = li.frequency;
 							entry.channel = li.channel;
+						}
+						let link_ifname = `${self.ifname}_link${lid}`;
+						let ldata = hostapd.sta_info(link_ifname, mac);
+						if (ldata) {
+							let lbw_sta = sta_bandwidth(ldata);
+							let lbw_ap = li?.bandwidth ?? 20;
+							entry.bandwidth = (lbw_sta < lbw_ap) ? lbw_sta : lbw_ap;
+							let lnss = sta_nss(ldata);
+							if (lnss)
+								entry.nss = lnss;
+							let lrssi = ldata.signal ? +ldata.signal : null;
+							let lnoise = get_noise(link_ifname);
+							if (lrssi != null)
+								entry.rssi = lrssi;
+							if (lnoise != null)
+								entry.noise = lnoise;
+							if (lrssi != null && lnoise != null)
+								entry.snr = lrssi - lnoise;
+							let lstd = sta_standard(ldata.flags, li?.frequency);
+							if (lstd)
+								entry.standard = lstd;
+							let lcaps = hostapd.sta_caps(ldata);
+							if (length(lcaps))
+								entry.caps = lcaps;
+						} else if (li) {
 							entry.bandwidth = li.bandwidth;
 						}
 						push(sta_links, entry);
 					}
 					if (length(sta_links))
 						sta.mlo_links = sta_links;
-					let nss = sta_nss(data);
-					if (nss)
-						sta.nss = nss;
-					let sta_bw = sta_bandwidth(data);
-					sta.bandwidth = (sta_bw < ap_max_bw) ? sta_bw : ap_max_bw;
-					if (rssi != null)
-						sta.rssi = rssi;
-					if (noise != null)
-						sta.noise = noise;
-					if (rssi != null && noise != null)
-						sta.snr = rssi - noise;
-					let std = sta_standard(data.flags, freq);
-					if (std)
-						sta.standard = std;
+					if (!length(sta_links)) {
+						let nss = sta_nss(data);
+						if (nss)
+							sta.nss = nss;
+						let sta_bw = sta_bandwidth(data);
+						sta.bandwidth = (sta_bw < ap_max_bw) ? sta_bw : ap_max_bw;
+						if (rssi != null)
+							sta.rssi = rssi;
+						if (noise != null)
+							sta.noise = noise;
+						if (rssi != null && noise != null)
+							sta.snr = rssi - noise;
+						let std = sta_standard(data.flags, freq);
+						if (std)
+							sta.standard = std;
+					}
 					if (data.connected_time)
 						sta.connected_time = +data.connected_time;
 					if (data.inactive_msec)
@@ -576,9 +605,11 @@ function ubus_methods(cursor) {
 						sta.rx_rate = +data.rx_rate_info;
 					if (data.tx_rate_info)
 						sta.tx_rate = +data.tx_rate_info;
-					let caps = hostapd.sta_caps(data);
-					if (length(caps))
-						sta.caps = caps;
+					if (!length(sta_links)) {
+						let caps = hostapd.sta_caps(data);
+						if (length(caps))
+							sta.caps = caps;
+					}
 					push(stas, sta);
 				}
 				req.reply({ stations: stas });
