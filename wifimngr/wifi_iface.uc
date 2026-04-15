@@ -491,7 +491,25 @@ function ubus_methods(cursor) {
 					nl80211.const.NL80211_CMD_GET_INTERFACE, 0,
 					{ dev: self.ifname }
 				);
-				let freq = iface?.wiphy_freq;
+				// Build per-link info map for MLD AP
+				let link_info = {};
+				let ap_max_bw = bw_map[iface?.channel_width] ?? 20;
+				let ap_max_freq = iface?.wiphy_freq;
+				if (iface?.mlo_links) {
+					for (let link in iface.mlo_links) {
+						let bw = bw_map[link.channel_width] ?? 20;
+						link_info[link.link_id] = {
+							bssid: link.mac,
+							frequency: link.wiphy_freq,
+							channel: freq_to_chan(link.wiphy_freq),
+							bandwidth: bw,
+						};
+						if (bw > ap_max_bw) ap_max_bw = bw;
+						if (link.wiphy_freq > (ap_max_freq ?? 0))
+							ap_max_freq = link.wiphy_freq;
+					}
+				}
+				let freq = ap_max_freq;
 				let stas = [];
 				for (let mac in macs) {
 					let data = hostapd.sta_info(self.ifname, mac);
@@ -501,12 +519,38 @@ function ubus_methods(cursor) {
 					let sta = { mac };
 					if (data.aid)
 						sta.aid = +data.aid;
+					// Query nl80211 for MLD assoc link id
+					let nlsta = nl80211.request(
+						nl80211.const.NL80211_CMD_GET_STATION, 0,
+						{ dev: self.ifname, mac }
+					);
+					if (nlsta?.mlo_link_id != null)
+						sta.assoc_link_id = nlsta.mlo_link_id;
+					if (nlsta?.mld_addr)
+						sta.mld_addr = nlsta.mld_addr;
+					// Collect per-link peer addresses from peer_addr[N]
+					let sta_links = [];
+					for (let k in data) {
+						let m = match(k, /^peer_addr\[([0-9]+)\]$/);
+						if (!m) continue;
+						let lid = +m[1];
+						let entry = { link_id: lid, peer_addr: data[k] };
+						let li = link_info[lid];
+						if (li) {
+							entry.bssid = li.bssid;
+							entry.frequency = li.frequency;
+							entry.channel = li.channel;
+							entry.bandwidth = li.bandwidth;
+						}
+						push(sta_links, entry);
+					}
+					if (length(sta_links))
+						sta.mlo_links = sta_links;
 					let nss = sta_nss(data);
 					if (nss)
 						sta.nss = nss;
 					let sta_bw = sta_bandwidth(data);
-					let ap_bw = bw_map[iface?.channel_width] ?? 20;
-					sta.bandwidth = (sta_bw < ap_bw) ? sta_bw : ap_bw;
+					sta.bandwidth = (sta_bw < ap_max_bw) ? sta_bw : ap_max_bw;
 					if (rssi != null)
 						sta.rssi = rssi;
 					if (noise != null)

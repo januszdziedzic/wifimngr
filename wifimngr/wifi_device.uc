@@ -2,6 +2,34 @@ import * as nl80211 from "nl80211";
 import * as wifi_opclass from "wifi_opclass";
 
 const band_names = { "0": "2g", "1": "5g", "3": "6g" };
+const bw_map = { "0": 20, "1": 20, "2": 40, "3": 80, "4": 8080, "5": 160, "6": 5, "7": 10, "13": 320 };
+const auto_channels = { "2g": 1, "5g": 36, "6g": 5 };
+
+// Map htmode string to bandwidth
+const htmode_bw = {
+	"HT20": 20, "HT40": 40,
+	"VHT20": 20, "VHT40": 40, "VHT80": 80, "VHT160": 160,
+	"HE20": 20, "HE40": 40, "HE80": 80, "HE160": 160,
+	"EHT20": 20, "EHT40": 40, "EHT80": 80, "EHT160": 160, "EHT320": 320,
+};
+
+function freq_to_chan(freq) {
+	if (freq == null)
+		return null;
+	if (freq == 2484)
+		return 14;
+	if (freq < 2484)
+		return (freq - 2407) / 5;
+	if (freq >= 4910 && freq <= 4980)
+		return (freq - 4000) / 5;
+	if (freq < 5950)
+		return (freq - 5000) / 5;
+	if (freq == 5935)
+		return 2;
+	if (freq <= 45000)
+		return (freq - 5950) / 5;
+	return null;
+}
 const iftype_names = { "managed": "sta", "ap": "ap", "ibss": "adhoc", "mesh_point": "mesh", "monitor": "monitor", "p2p_client": "p2p_client", "p2p_go": "p2p_go" };
 const iftype_num_names = { "2": "sta", "3": "ap", "7": "mesh" };
 const MAX_AGE = 600;
@@ -256,16 +284,67 @@ function get_band_freq_set() {
 	return set;
 }
 
-function get_status() {
+function get_channel_info(cursor) {
+	let freq_set = this.get_band_freq_set();
+
+	// Dump all interfaces on this wiphy
+	let r = nl80211.request(
+		nl80211.const.NL80211_CMD_GET_INTERFACE,
+		nl80211.const.NLM_F_DUMP, {}
+	);
+	if (!r) return null;
+
+	let ifaces = type(r) == "array" ? r : [ r ];
+	for (let iface in ifaces) {
+		if (iface.wiphy != this.wiphy)
+			continue;
+
+		// Check MLD links first
+		if (iface.mlo_links) {
+			for (let link in iface.mlo_links) {
+				if (link.wiphy_freq && freq_set && freq_set[link.wiphy_freq]) {
+					return {
+						channel: freq_to_chan(link.wiphy_freq),
+						frequency: link.wiphy_freq,
+						bandwidth: bw_map[link.channel_width] ?? link.channel_width,
+						center_freq1: link.center_freq1,
+					};
+				}
+			}
+		}
+
+		// Non-MLD: check interface frequency directly
+		if (iface.wiphy_freq && freq_set && freq_set[iface.wiphy_freq]) {
+			return {
+				channel: freq_to_chan(iface.wiphy_freq),
+				frequency: iface.wiphy_freq,
+				bandwidth: bw_map[iface.channel_width] ?? iface.channel_width,
+				center_freq1: iface.center_freq1,
+			};
+		}
+	}
+
+	return null;
+}
+
+function get_status(cursor) {
 	let bands = this.get_wiphy_bands();
 	if (!bands)
 		return null;
+
+	let chinfo = this.get_channel_info(cursor);
 
 	let status = {
 		wiphy: this.wiphy,
 		name: this.name,
 		band: this.band,
 	};
+	if (chinfo) {
+		if (chinfo.channel)
+			status.channel = chinfo.channel;
+		if (chinfo.bandwidth)
+			status.bandwidth = chinfo.bandwidth;
+	}
 
 	for (let idx, band in bands) {
 		if ((band_names[idx] ?? idx) != this.band)
@@ -476,7 +555,7 @@ function ubus_methods(cursor) {
 		},
 		status: {
 			call: function(req) {
-				let s = self.get_status();
+				let s = self.get_status(cursor);
 				if (!s) {
 					req.reply({ error: "phy not found" });
 					return;
@@ -528,6 +607,7 @@ const device_proto = {
 	get_wiphy_bands,
 	get_band_freqs,
 	get_band_freq_set,
+	get_channel_info,
 	get_status,
 	get_e4,
 	update_scan_cache,
