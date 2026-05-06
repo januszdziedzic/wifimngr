@@ -2,40 +2,84 @@
  * ucode mosquitto module — wraps libmosquitto with uloop integration
  *
  * Exposes an MQTT client API to ucode scripts backed by libmosquitto,
- * giving full TLS, QoS, will, auth and async reconnect support.
+ * giving full QoS, will and auth support, plus TLS when the system has
+ * the libmosquitto-ssl variant installed. The libmosquitto socket
+ * is registered with uloop so MQTT I/O runs in the same event loop as
+ * the rest of the application; the libmosquitto helper thread is not
+ * used. To reconnect after a broker drop, call client.connect() again
+ * from the on_disconnect callback.
  *
- * Usage from ucode:
+ * Usage from ucode (TLS example):
  *
- *   import * as mqtt from 'mosquitto';
+ *   import * as mqtt  from 'mosquitto';
+ *   import * as uloop from 'uloop';
  *
- *   let client = mqtt.new("my-client-id");
+ *   uloop.init();
+ *
+ *   let client = mqtt.new("my-agent", true);
+ *
+ *   client.tls_set({
+ *       cafile:   "/etc/cert/ca.crt",
+ *       certfile: "/etc/cert/client.crt",
+ *       keyfile:  "/etc/cert/client.key",
+ *   });
+ *
+ *   // Last-will so subscribers know when agent dies unexpectedly
+ *   client.will_set("my-agent/status",
+ *       '{"online":false}', 0, true);
  *
  *   client.on_connect(function(rc) {
- *       if (rc == 0) {
- *           client.subscribe("home/#", 0);
- *           client.publish("home/status", "online", 0, true);
- *       }
+ *       if (rc != 0) return;
+ *       client.subscribe("my-agent/cmd", 0);
+ *       client.publish("my-agent/status", '{"online":true}', 0, true);
  *   });
  *
  *   client.on_message(function(topic, payload, qos, retain) {
  *       print(topic + ": " + payload + "\n");
  *   });
  *
- *   client.on_disconnect(function(rc) { warn("disconnected: " + rc + "\n"); });
+ *   client.on_disconnect(function(rc) {
+ *       warn("disconnected (rc=" + rc + ")\n");
+ *       client.loop_stop();
+ *       client.destroy();
+ *       uloop.end();
+ *   });
  *
- *   // Optional TLS (for port 8883)
- *   client.tls_set({ cafile: "/etc/ssl/certs/ca-certificates.crt" });
+ *   client.on_subscribe(function(mid, granted_qos) {
+ *       warn("subscribed, granted qos: " + granted_qos[0] + "\n");
+ *   });
  *
- *   // Optional auth
- *   client.username_pw_set("user", "secret");
- *
- *   client.connect("broker.local", 1883, 60);
+ *   client.connect("broker.example.com", 8883, 60);
  *   client.loop_start();   // register with uloop; call before uloop.run()
  *
+ *   uloop.signal("SIGTERM", function() {
+ *       // Queue the LWT update and DISCONNECT, then let uloop keep
+ *       // running so they reach the broker. Cleanup is in on_disconnect.
+ *       client.publish("my-agent/status", '{"online":false}', 0, true);
+ *       client.disconnect();
+ *   });
+ *
+ *   uloop.run();
+ *
+ * Optional plain-text auth:
+ *   client.username_pw_set("user", "secret");
+ *
+ * Optional: skip hostname verification (dev only):
+ *   client.tls_insecure_set(true);
+ *
  * Call client.loop_stop() to deregister from uloop before destroying.
+ *
+ * Lifecycle: client.destroy() must be called when the client is no longer
+ * needed (typically from a SIGTERM/SIGINT handler as in the example above).
+ * The resource holds a self-reference so that uloop callbacks can keep
+ * firing after the script drops its handle; without an explicit destroy()
+ * the client, its mosquitto context, and any uloop registration leak for
+ * the lifetime of the ucode VM. This mirrors the cancel() requirement on
+ * ucode's own uloop.timer / uloop.handle resources.
  */
 
 #include <errno.h>
+#include <limits.h>
 #include <string.h>
 #include <stdint.h>
 
@@ -66,7 +110,6 @@ typedef struct {
 	struct uloop_fd     ufd;        /* registered socket watcher */
 	struct uloop_timeout misc_tmr;  /* periodic mosquitto_loop_misc() */
 	bool                loop_active;
-	int                 last_err;
 } uc_mosq_t;
 
 /* -------------------------------------------------------------------------
@@ -91,12 +134,23 @@ static void
 mosq_uloop_fd_cb(struct uloop_fd *ufd, unsigned int events)
 {
 	uc_mosq_t *m = container_of(ufd, uc_mosq_t, ufd);
+	int rc = MOSQ_ERR_SUCCESS;
 
 	if (events & ULOOP_READ)
-		mosquitto_loop_read(m->mosq, 1);
+		rc = mosquitto_loop_read(m->mosq, 1);
 
-	if ((events & ULOOP_WRITE) && mosquitto_want_write(m->mosq))
-		mosquitto_loop_write(m->mosq, 1);
+	if (rc == MOSQ_ERR_SUCCESS &&
+	    (events & ULOOP_WRITE) && mosquitto_want_write(m->mosq))
+		rc = mosquitto_loop_write(m->mosq, 1);
+
+	/* On I/O error libmosquitto invalidates the socket internally; drop
+	 * the watcher right away so we don't spin against a dead descriptor
+	 * before the disconnect callback or misc timer cleans up */
+	if (rc != MOSQ_ERR_SUCCESS && mosquitto_socket(m->mosq) < 0) {
+		uloop_fd_delete(&m->ufd);
+		m->ufd.fd = -1;
+		return;
+	}
 
 	/* Re-evaluate write interest after each I/O cycle */
 	mosq_uloop_update(m);
@@ -112,11 +166,16 @@ mosq_misc_timer_cb(struct uloop_timeout *t)
 
 	fd = mosquitto_socket(m->mosq);
 
-	/* Reconnect may have changed the fd — re-register if so */
-	if (fd >= 0 && fd != m->ufd.fd) {
+	if (fd < 0) {
+		/* Connection gone — drop stale registration so a reused fd
+		 * number cannot trigger callbacks against a different owner */
+		if (m->ufd.fd >= 0) {
+			uloop_fd_delete(&m->ufd);
+			m->ufd.fd = -1;
+		}
+	} else if (fd != m->ufd.fd) {
 		uloop_fd_delete(&m->ufd);
 		m->ufd.fd = fd;
-		uloop_fd_add(&m->ufd, ULOOP_READ);
 	}
 
 	mosq_uloop_update(m);
@@ -128,11 +187,13 @@ mosq_uloop_update(uc_mosq_t *m)
 {
 	unsigned int flags = ULOOP_READ;
 
+	if (!m->loop_active || m->ufd.fd < 0)
+		return;
+
 	if (mosquitto_want_write(m->mosq))
 		flags |= ULOOP_WRITE;
 
-	if (m->ufd.fd >= 0)
-		uloop_fd_add(&m->ufd, flags);
+	uloop_fd_add(&m->ufd, flags);
 }
 
 static void
@@ -145,12 +206,14 @@ mosq_uloop_register(uc_mosq_t *m)
 
 	m->ufd.fd = fd;
 	m->ufd.cb = mosq_uloop_fd_cb;
-	uloop_fd_add(&m->ufd, ULOOP_READ);
-
 	m->misc_tmr.cb = mosq_misc_timer_cb;
-	uloop_timeout_set(&m->misc_tmr, 1000);
 
 	m->loop_active = true;
+
+	/* mosq_uloop_update() requires loop_active=true; sets READ + WRITE
+	 * flags as needed so any pending CONNECT packet is flushed promptly */
+	mosq_uloop_update(m);
+	uloop_timeout_set(&m->misc_tmr, 1000);
 }
 
 static void
@@ -161,6 +224,7 @@ mosq_uloop_unregister(uc_mosq_t *m)
 
 	uloop_fd_delete(&m->ufd);
 	uloop_timeout_cancel(&m->misc_tmr);
+	m->ufd.fd = -1;
 	m->loop_active = false;
 }
 
@@ -183,6 +247,8 @@ mosq_invoke_cb(uc_mosq_t *m, int slot, uc_value_t **args, size_t nargs)
 
 	if (uc_vm_call(m->vm, true, nargs) == EXCEPTION_NONE)
 		ucv_put(uc_vm_stack_pop(m->vm));
+	else
+		ucv_put(uc_vm_exception_object(m->vm));
 }
 
 static void
@@ -192,13 +258,13 @@ cb_on_connect(struct mosquitto *mosq, void *obj, int rc)
 	uc_value_t *args[] = { ucv_int64_new(rc) };
 
 	/* On successful (re)connect the fd may be new — refresh uloop */
-	if (rc == 0) {
+	if (rc == 0 && m->loop_active) {
 		int fd = mosquitto_socket(m->mosq);
-		if (m->loop_active && fd >= 0 && fd != m->ufd.fd) {
+		if (fd >= 0 && fd != m->ufd.fd) {
 			uloop_fd_delete(&m->ufd);
 			m->ufd.fd = fd;
-			uloop_fd_add(&m->ufd, ULOOP_READ);
 		}
+		mosq_uloop_update(m);
 	}
 
 	mosq_invoke_cb(m, CB_ON_CONNECT, args, 1);
@@ -211,6 +277,14 @@ cb_on_disconnect(struct mosquitto *mosq, void *obj, int rc)
 	uc_mosq_t *m = obj;
 	uc_value_t *args[] = { ucv_int64_new(rc) };
 
+	/* libmosquitto closes the socket before calling us; drop the now-stale
+	 * uloop watcher so we don't spin on a closed fd, and so a connect()
+	 * issued from the user callback starts from a clean slate */
+	if (m->loop_active && m->ufd.fd >= 0 && mosquitto_socket(m->mosq) < 0) {
+		uloop_fd_delete(&m->ufd);
+		m->ufd.fd = -1;
+	}
+
 	mosq_invoke_cb(m, CB_ON_DISCONNECT, args, 1);
 	ucv_put(args[0]);
 }
@@ -221,9 +295,11 @@ cb_on_message(struct mosquitto *mosq, void *obj,
 {
 	uc_mosq_t *m = obj;
 
-	/* payload may be NULL for zero-length messages */
+	/* payload may be NULL for zero-length messages; payloadlen is int in
+	 * libmosquitto's struct so guard against a malformed negative value */
 	const char *pl  = msg->payload ? msg->payload : "";
-	int         pll = msg->payload ? msg->payloadlen : 0;
+	size_t      pll = (msg->payload && msg->payloadlen > 0)
+	                    ? (size_t)msg->payloadlen : 0;
 
 	uc_value_t *args[] = {
 		ucv_string_new(msg->topic),
@@ -335,7 +411,7 @@ uc_mosq_new(uc_vm_t *vm, size_t nargs)
 	}
 
 	m->vm  = vm;
-	m->res = res;
+	m->res = ucv_get(res);
 	m->ufd.fd = -1;
 
 	mosquitto_connect_callback_set(m->mosq,    cb_on_connect);
@@ -345,7 +421,7 @@ uc_mosq_new(uc_vm_t *vm, size_t nargs)
 	mosquitto_subscribe_callback_set(m->mosq,  cb_on_subscribe);
 
 	ucv_resource_persistent_set(res, true);
-	ok_return(ucv_get(res));
+	ok_return(res);
 }
 
 /* -------------------------------------------------------------------------
@@ -383,32 +459,9 @@ uc_mosq_disconnect(uc_vm_t *vm, size_t nargs)
 	if (!m) return NULL;
 
 	int rc = mosquitto_disconnect(m->mosq);
+	mosq_uloop_update(m);   /* flush queued DISCONNECT frame promptly */
 	if (rc != MOSQ_ERR_SUCCESS && rc != MOSQ_ERR_NO_CONN)
 		err_return(rc, "disconnect");
-
-	ok_return(ucv_boolean_new(true));
-}
-
-/* -------------------------------------------------------------------------
- * client.reconnect_delay_set(delay, delay_max, exponential_backoff)
- * ---------------------------------------------------------------------- */
-static uc_value_t *
-uc_mosq_reconnect_delay_set(uc_vm_t *vm, size_t nargs)
-{
-	uc_mosq_t  *m      = mosq_get(vm);
-	uc_value_t *d_v    = uc_fn_arg(0);
-	uc_value_t *dmax_v = uc_fn_arg(1);
-	uc_value_t *exp_v  = uc_fn_arg(2);
-
-	if (!m) return NULL;
-
-	unsigned int delay     = d_v    ? (unsigned)ucv_int64_get(d_v)    : 1;
-	unsigned int delay_max = dmax_v ? (unsigned)ucv_int64_get(dmax_v) : 30;
-	bool         expo      = exp_v  ? ucv_is_truish(exp_v)            : false;
-
-	int rc = mosquitto_reconnect_delay_set(m->mosq, delay, delay_max, expo);
-	if (rc != MOSQ_ERR_SUCCESS)
-		err_return(rc, "reconnect_delay_set");
 
 	ok_return(ucv_boolean_new(true));
 }
@@ -442,6 +495,12 @@ uc_mosq_publish(uc_vm_t *vm, size_t nargs)
 	if (pay_v && ucv_type(pay_v) == UC_STRING) {
 		payload = ucv_string_get(pay_v);
 		paylen  = ucv_string_length(pay_v);
+	}
+
+	if (paylen > INT_MAX) {
+		uc_vm_raise_exception(vm, EXCEPTION_RUNTIME,
+		    "mosquitto: publish: payload too large");
+		return NULL;
 	}
 
 	int mid = 0;
@@ -505,6 +564,7 @@ uc_mosq_unsubscribe(uc_vm_t *vm, size_t nargs)
 	if (rc != MOSQ_ERR_SUCCESS)
 		err_return(rc, "unsubscribe");
 
+	mosq_uloop_update(m);
 	ok_return(ucv_int64_new(mid));
 }
 
@@ -558,6 +618,12 @@ uc_mosq_will_set(uc_vm_t *vm, size_t nargs)
 	if (pay_v && ucv_type(pay_v) == UC_STRING) {
 		payload = ucv_string_get(pay_v);
 		paylen  = ucv_string_length(pay_v);
+	}
+
+	if (paylen > INT_MAX) {
+		uc_vm_raise_exception(vm, EXCEPTION_RUNTIME,
+		    "mosquitto: will_set: payload too large");
+		return NULL;
 	}
 
 	int rc = mosquitto_will_set(m->mosq,
@@ -678,6 +744,12 @@ uc_mosq_loop_start(uc_vm_t *vm, size_t nargs)
 	uc_mosq_t *m = mosq_get(vm);
 	if (!m) return NULL;
 
+	if (mosquitto_socket(m->mosq) < 0) {
+		uc_vm_raise_exception(vm, EXCEPTION_RUNTIME,
+		    "mosquitto: loop_start: no socket — call connect() first");
+		return NULL;
+	}
+
 	mosq_uloop_register(m);
 	ok_return(ucv_boolean_new(true));
 }
@@ -702,10 +774,29 @@ static uc_value_t *
 uc_mosq_destroy(uc_vm_t *vm, size_t nargs)
 {
 	uc_mosq_t *m = uc_fn_thisval("mosquitto.client");
+	uc_value_t *res;
+
 	if (!m) return NULL;
 
-	free_client(m);
-	ucv_resource_persistent_set(m->res, false);
+	mosq_uloop_unregister(m);
+
+	if (m->mosq) {
+		mosquitto_disconnect(m->mosq);
+		mosquitto_destroy(m->mosq);
+		m->mosq = NULL;
+	}
+
+	/* Release the self-reference taken in uc_mosq_new(); when the script
+	 * also drops its handle the resource refcount falls to zero and
+	 * free_client() runs via the type destructor. Null first so a
+	 * re-entrant free_client() call from ucv_put() is a no-op. */
+	res = m->res;
+	m->res = NULL;
+	if (res) {
+		ucv_resource_persistent_set(res, false);
+		ucv_put(res);
+	}
+
 	ok_return(ucv_boolean_new(true));
 }
 
@@ -732,7 +823,6 @@ uc_mosq_version(uc_vm_t *vm, size_t nargs)
 static const uc_function_list_t client_fns[] = {
 	{ "connect",             uc_mosq_connect             },
 	{ "disconnect",          uc_mosq_disconnect          },
-	{ "reconnect_delay_set", uc_mosq_reconnect_delay_set },
 	{ "publish",             uc_mosq_publish             },
 	{ "subscribe",           uc_mosq_subscribe           },
 	{ "unsubscribe",         uc_mosq_unsubscribe         },
