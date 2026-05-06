@@ -161,8 +161,16 @@ function publish_entries() {
 			obj_name, info.phy, info.wiphy, info.band);
 	});
 
-	// Register wifi.ap.X or wifi.sta.X using real ifname
+	// Register wifi.<mode>.X using real ifname
 	let ifnames = get_iface_names();
+
+	const mode_prefix = {
+		ap: "wifi.ap.",
+		sta: "wifi.sta.",
+		mesh: "wifi.mesh.",
+		adhoc: "wifi.adhoc.",
+		monitor: "wifi.monitor.",
+	};
 
 	cursor.foreach("wireless", "wifi-iface", function(s) {
 		if (s.disabled == "1")
@@ -170,7 +178,7 @@ function publish_entries() {
 
 		let section = s[".name"];
 		let mode = s.mode || "ap";
-		let prefix = (mode == "sta") ? "wifi.sta." : "wifi.ap.";
+		let prefix = mode_prefix[mode] ?? ("wifi." + mode + ".");
 		let ifname = s.ifname || ifnames[section];
 
 		if (!ifname) {
