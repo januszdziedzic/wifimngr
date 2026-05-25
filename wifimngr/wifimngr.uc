@@ -23,6 +23,18 @@ function phy_from_path(path) {
 	if (!phys)
 		return null;
 
+	// Handle +N suffix: DBDC chips expose multiple radios under the same
+	// device path; OpenWrt UCI uses "path+1", "path+2" etc. to distinguish them.
+	let match_index = 0;
+	let base_path = path;
+	let plus = index(path, "+");
+	if (plus >= 0) {
+		match_index = +substr(path, plus + 1);
+		base_path = substr(path, 0, plus);
+	}
+
+	sort(phys);
+	let count = 0;
 	for (let phy in phys) {
 		let link = realpath(`/sys/class/ieee80211/${phy}/device`);
 		if (!link)
@@ -37,8 +49,11 @@ function phy_from_path(path) {
 		if (substr(link, 0, length(prefix)) == prefix && index(link, "/pci") >= 0)
 			link = substr(link, length(prefix));
 
-		if (link == path)
-			return phy;
+		if (link == base_path) {
+			if (count == match_index)
+				return phy;
+			count++;
+		}
 	}
 	return null;
 }
