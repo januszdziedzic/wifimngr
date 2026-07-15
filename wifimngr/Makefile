@@ -39,6 +39,7 @@ define Package/wifimngr/install
 	$(INSTALL_DATA) ./wifi_iface.uc $(1)/usr/share/wifimngr/
 	$(INSTALL_DATA) ./wifi_opclass.uc $(1)/usr/share/wifimngr/
 	$(INSTALL_DATA) ./hostapd_cli.uc $(1)/usr/share/wifimngr/
+	$(INSTALL_DATA) ./wpa_cli.uc $(1)/usr/share/wifimngr/
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/wifimngr.init $(1)/etc/init.d/wifimngr
 endef

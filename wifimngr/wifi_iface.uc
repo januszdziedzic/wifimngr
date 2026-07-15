@@ -1,6 +1,7 @@
 import * as nl80211 from "nl80211";
 import * as fs from "fs";
 import hostapd from "hostapd_cli";
+import wpa from "wpa_cli";
 
 function hostapd_info(ifname) {
 	let cfg = hostapd.get_config(ifname);
@@ -62,10 +63,10 @@ function freq_to_chan(freq) {
 		return (freq - 2407) / 5;
 	if (freq >= 4910 && freq <= 4980)
 		return (freq - 4000) / 5;
-	if (freq < 5950)
-		return (freq - 5000) / 5;
 	if (freq == 5935)
 		return 2;
+	if (freq < 5950)
+		return (freq - 5000) / 5;
 	if (freq <= 45000)
 		return (freq - 5950) / 5;
 	return null;
@@ -201,7 +202,7 @@ function get_status(cursor) {
 
 	let status = {
 		ifname: this.ifname,
-		enabled: !!r.ssid,
+		enabled: !(uci && (uci.disabled == "1" || uci.disabled == 1 || uci.disabled == true)),
 		status: "stopped",
 		mode: iftype_map[r.iftype] ?? "unknown",
 		ssid: r.ssid,
@@ -237,6 +238,10 @@ function get_status(cursor) {
 	} else {
 		if (netdev_operstate(this.ifname) == "up")
 			status.status = "running";
+		// mesh/sta are managed by wpa_supplicant; SSID isn't exposed via nl80211
+		let wst = wpa.status(this.ifname);
+		if (wst?.ssid != null && wst.ssid != "")
+			status.ssid = wst.ssid;
 	}
 
 	if (r.mlo_links != null) {
