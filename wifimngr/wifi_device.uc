@@ -22,10 +22,10 @@ function freq_to_chan(freq) {
 		return (freq - 2407) / 5;
 	if (freq >= 4910 && freq <= 4980)
 		return (freq - 4000) / 5;
-	if (freq < 5950)
-		return (freq - 5000) / 5;
 	if (freq == 5935)
 		return 2;
+	if (freq < 5950)
+		return (freq - 5000) / 5;
 	if (freq <= 45000)
 		return (freq - 5950) / 5;
 	return null;
@@ -337,21 +337,28 @@ function get_status(cursor) {
 	let status = {
 		wiphy: this.wiphy,
 		name: this.name,
-		band: this.band,
 	};
-	if (chinfo) {
-		if (chinfo.channel)
-			status.channel = chinfo.channel;
-		if (chinfo.bandwidth)
-			status.bandwidth = chinfo.bandwidth;
+
+	// Expose each supported band's channel list, not just the configured one
+	let band_map = {};
+	for (let idx, band in bands) {
+		let name = band_names[idx] ?? idx;
+
+		let channels = [];
+		for (let freq in band.frequencies) {
+			let ch = freq_to_chan(freq);
+			if (ch != null)
+				push(channels, ch);
+		}
+		band_map[name] = { channels };
 	}
+	if (length(band_map))
+		status.bands = band_map;
 
 	for (let idx, band in bands) {
 		if ((band_names[idx] ?? idx) != this.band)
 			continue;
 
-		if (length(band.frequencies))
-			status.frequencies = band.frequencies;
 		if (length(band.bitrates))
 			status.bitrates = band.bitrates;
 
@@ -406,6 +413,23 @@ function get_status(cursor) {
 			status.caps = base_caps;
 		}
 		break;
+	}
+
+	// Operating info last: country / band / freq / bandwidth
+	if (cursor) {
+		cursor.load("wireless");
+		let country = cursor.get("wireless", this.name, "country");
+		if (country)
+			status.country = country;
+	}
+	status.band = this.band;
+	if (chinfo) {
+		if (chinfo.frequency)
+			status.freq = chinfo.frequency;
+		if (chinfo.channel)
+			status.channel = chinfo.channel;
+		if (chinfo.bandwidth)
+			status.bandwidth = chinfo.bandwidth;
 	}
 
 	return status;
